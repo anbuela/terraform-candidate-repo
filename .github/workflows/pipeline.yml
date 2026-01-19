@@ -1,0 +1,211 @@
+name: Terraform Pipeline
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  detect-changes:
+    name: Detect changed stacks
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      run_any: ${{ steps.set-matrix.outputs.run_any }}
+      changelog_only: ${{ steps.set-matrix.outputs.changelog_only }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute changed files
+        id: diff
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Determine base/head for diff depending on event type
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.sha }}"
+          fi
+
+          echo "BASE=$BASE" >> "$GITHUB_OUTPUT"
+          echo "HEAD=$HEAD" >> "$GITHUB_OUTPUT"
+
+          git diff --name-only "$BASE" "$HEAD" > changed_files.txt
+
+          echo "Changed files:"
+          cat changed_files.txt
+
+      - name: Build matrix
+        id: set-matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Flags for what changed
+          payment_changed=false
+          user_changed=false
+          global_iam_changed=false
+          global_other_changed=false
+          non_changelog_changed=false
+
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+
+            if [[ "$f" != "CHANGELOG.md" ]]; then
+              non_changelog_changed=true
+            fi
+
+            case "$f" in
+              apps/payment-api/*) payment_changed=true ;;
+              apps/user-api/*) user_changed=true ;;
+              global/iam/*) global_iam_changed=true ;;
+              global/s3/*|global/*) global_other_changed=true ;;
+              *) ;;
+            esac
+          done < changed_files.txt
+
+          changelog_only=false
+          if [[ "$non_changelog_changed" == "false" ]]; then
+            changelog_only=true
+          fi
+
+
+          stacks=()
+          if [[ "$changelog_only" == "true" ]]; then
+            # no stacks
+            :
+          elif [[ "$global_iam_changed" == "true" ]]; then
+            stacks+=("apps/payment-api")
+            stacks+=("apps/user-api")
+          else
+            [[ "$payment_changed" == "true" ]] && stacks+=("apps/payment-api")
+            [[ "$user_changed" == "true" ]] && stacks+=("apps/user-api")
+          fi
+
+    
+
+          run_any=false
+          if (( ${#stacks[@]} > 0 )); then
+            run_any=true
+          fi
+
+          # Create JSON matrix: {"include":[{"stack":"apps/payment-api"}, ...]}
+          json='{"include":['
+          first=true
+          for s in "${stacks[@]}"; do
+            if [[ "$first" == "true" ]]; then
+              first=false
+            else
+              json+=','
+            fi
+            json+="{\"stack\":\"$s\"}"
+          done
+          json+=']}'
+
+          echo "Matrix JSON: $json"
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "run_any=$run_any" >> "$GITHUB_OUTPUT"
+          echo "changelog_only=$changelog_only" >> "$GITHUB_OUTPUT"
+
+      - name: Job Summary (detect)
+        shell: bash
+        run: |
+          {
+            echo "## Smart Pipeline – Change Detection"
+            echo ""
+            echo "- Event: **${{ github.event_name }}**"
+            echo "- Changelog only: **${{ steps.set-matrix.outputs.changelog_only }}**"
+            echo "- Will run terraform plans: **${{ steps.set-matrix.outputs.run_any }}**"
+            echo ""
+            echo "### Selected stacks"
+            echo '```json'
+            echo '${{ steps.set-matrix.outputs.matrix }}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  terraform-plan:
+    name: Terraform plan
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.run_any == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform fmt (optional)
+        working-directory: ${{ matrix.stack }}
+        run: terraform fmt -check
+
+      - name: Terraform init
+        working-directory: ${{ matrix.stack }}
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        working-directory: ${{ matrix.stack }}
+        run: terraform validate
+
+      - name: Terraform plan
+        id: plan
+        working-directory: ${{ matrix.stack }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          terraform plan -no-color -input=false | tee plan.txt
+
+      - name: Write Plan to Job Summary
+        if: always()
+        working-directory: ${{ matrix.stack }}
+        shell: bash
+        run: |
+          {
+            echo "## Terraform Plan – \`${{ matrix.stack }}\`"
+            echo ""
+            echo "<details><summary>Show plan output</summary>"
+            echo ""
+            echo '```'
+            # Limit to avoid huge summaries; adjust as needed
+            tail -n 4000 plan.txt
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  no-op:
+    name: No changes requiring terraform
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.run_any != 'true'
+    steps:
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## Smart Pipeline – No Terraform Run"
+            echo ""
+            if [[ "${{ needs.detect-changes.outputs.changelog_only }}" == "true" ]]; then
+              echo "- Only **CHANGELOG.md** changed → exiting successfully"
+            else
+              echo "- No relevant stack changes detected → exiting successfully"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
